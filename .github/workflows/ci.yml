@@ -1,0 +1,221 @@
+on:
+    workflow_dispatch:
+    repository_dispatch:
+    push:
+      paths:
+        - .github/workflows/ci.yml
+      branches:
+        - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.event.client_payload.ref || 'refs/heads/master'}}
+  cancel-in-progress: true
+
+jobs:
+    ci:
+        name: Integration Testing
+        if: ${{ !github.event.client_payload.ref || github.event.client_payload.ref == 'refs/heads/master' }}
+        runs-on: ubuntu-latest
+        env:
+            REPO_BACKEND: EzyTaskin_Backend
+            REPO_FRONTEND: EzyTaskin_Frontend
+            REPO_CI: EzyTaskin_CI
+        steps:
+            - name: Setup Deploy Keys
+              env:
+                EZY_BACKEND: ${{ secrets.EZY_BACKEND }}
+                EZY_FRONTEND: ${{ secrets.EZY_FRONTEND }}
+                EZY_CI: ${{ secrets.EZY_CI }}
+              run: |
+                mkdir -p $HOME/.ssh
+
+                echo "$EZY_BACKEND" > $HOME/.ssh/ezy_backend
+                echo "$EZY_FRONTEND" > $HOME/.ssh/ezy_frontend
+                echo "$EZY_CI" > $HOME/.ssh/ezy_ci
+
+                chmod 0600 $HOME/.ssh/ezy*
+
+                echo "
+                    Host backend.ezytaskin
+                        Hostname github.com
+                        IdentityFile=$HOME/.ssh/ezy_backend
+                        User git
+
+                    Host frontend.ezytaskin
+                        Hostname github.com
+                        IdentityFile=$HOME/.ssh/ezy_frontend
+                        User git
+
+                    Host ci.ezytaskin
+                        Hostname github.com
+                        IdentityFile=$HOME/.ssh/ezy_ci
+                        User git
+                " >> $HOME/.ssh/config
+
+            - name: Setup PostgreSQL
+              run: |
+                sudo apt install -y postgresql-common
+                yes | sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+                sudo apt install -y postgresql-16
+                sudo systemctl start postgresql.service
+                sudo -u postgres bash -c "psql -c \"CREATE USER sephera WITH PASSWORD 'ci';\""
+                sudo -u postgres bash -c "psql -c \"CREATE DATABASE ezytaskin;\""
+                sudo -u postgres bash -c "psql -c \"GRANT ALL ON DATABASE ezytaskin TO sephera;\""
+                sudo -u postgres bash -c "psql -c \"ALTER DATABASE ezytaskin OWNER TO sephera;\""
+
+            - name: Setup .NET 9 SDK
+              uses: actions/setup-dotnet@v4
+              with:
+                dotnet-version: '9.0.x'
+
+            - name: Setup .NET tools
+              run: |
+                dotnet tool install dotnet-ef --global
+
+            - name: Build and Test Backend
+              run: |
+                git clone git@backend.ezytaskin:${{ github.repository_owner }}/${{ env.REPO_BACKEND }}.git ${{ github.workspace }}/backend
+
+                pushd ${{ github.workspace }}/backend
+
+                # Add Dummy Secrets
+                echo "{
+                    \"ConnectionStrings\": {
+                      \"DefaultConnection\": \"Host=localhost; Database=ezytaskin; Username=sephera; Password=ci\"
+                    },
+                    \"ApiKeys\": {
+                      \"Postmark\": \"Dummy API Key\"
+                    },
+                    \"Authentication\": {
+                      \"Google\": {
+                        \"ClientId\": \"Dummy API Key\",
+                        \"ClientSecret\": \"Dummy API Key\"
+                      },
+                      \"Microsoft\": {
+                        \"ClientId\": \"Dummy API Key\",
+                        \"ClientSecret\": \"Dummy API Key\"
+                      }
+                    }
+                }" > EzyTaskin/appsettings.Secrets.json
+
+                # Restore
+                dotnet restore
+
+                # Build and Publish a Release
+                dotnet build EzyTaskin/EzyTaskin.csproj -c Release --no-restore
+                dotnet publish EzyTaskin/EzyTaskin.csproj -c Release -o ${{ github.workspace }}/out --no-build
+
+                # Backend Unit Tests
+                dotnet test -c Release
+
+                # Test Database Migrations
+                dotnet ef migrations bundle --project EzyTaskin/EzyTaskin.csproj --configuration Release -o ${{ github.workspace }}/out/DbUpdate -f
+
+                pushd ${{ github.workspace }}/out
+                ./DbUpdate
+                popd
+
+                popd
+
+            - name: Build and Test Frontend
+              run: |
+                git clone git@frontend.ezytaskin:${{ github.repository_owner }}/${{ env.REPO_FRONTEND }}.git ${{ github.workspace }}/frontend
+
+                pushd ${{ github.workspace }}/frontend
+
+                # Restore
+                npm install
+
+                # Build and Publish a Release
+                npm run build
+
+                # Move Output Files
+                mv out "${{ github.workspace }}/out/wwwroot"
+
+                popd
+
+            - name: Integration Testing
+              run: |
+                set +e
+
+                pushd ${{ github.workspace }}/out
+
+                timeout 1m dotnet EzyTaskin.dll
+                RETURN_CODE=$?
+                if [ "$RETURN_CODE" -eq "124" ]; then
+                  # The server ran for 1m without failing
+                  exit 0
+                else
+                  exit 1
+                fi
+
+                popd
+
+            - name: Create Tarball
+              run: |
+                pushd ${{ github.workspace }}/out
+                fileName=${{ github.workspace }}/EzyTaskin
+                tar -cf $fileName.tar *
+                gzip -9 < $fileName.tar > $fileName.tar.gz
+                popd
+
+            - name: Create Release
+              if: ${{ github.ref == 'refs/heads/master' }}
+              uses: marvinpinto/action-automatic-releases@latest
+              with:
+                repo_token: "${{ secrets.GITHUB_TOKEN }}"
+                automatic_release_tag: EzyTaskin-${{ github.run_number }}-${{ github.run_attempt }}
+                prerelease: false
+                title: EzyTaskin
+                files: |
+                    ${{ github.workspace }}/EzyTaskin.tar.gz
+
+            - name: Write Dockerfile
+              if: ${{ github.ref == 'refs/heads/master' }}
+              run: |
+                git clone git@ci.ezytaskin:${{ github.repository_owner }}/${{ env.REPO_CI }}.git ${{ github.workspace }}/ci -b deploy
+
+                pushd ${{ github.workspace }}/ci
+
+                DATE=$(date)
+
+                echo "# Generated by EzyTaskin CI on $DATE.
+                # DO NOT EDIT.
+
+                FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build-env
+                WORKDIR /App
+
+                ENV PATH=\"\${PATH}:/root/.dotnet/tools\"
+
+                # Download archive
+                RUN curl -SL ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/EzyTaskin.tar.gz | tar -xzf -
+
+                # Load development secrets & copy for publish
+                RUN --mount=type=secret,id=appsettings_Secrets_json,dst=/etc/secrets/appsettings.Secrets.json \
+                    cp /etc/secrets/appsettings.Secrets.json .
+
+                # Synchronize database state
+                RUN ./DbUpdate
+
+                # Build runtime image
+                FROM mcr.microsoft.com/dotnet/aspnet:9.0
+                WORKDIR /App
+                COPY --from=build-env /App .
+                ENTRYPOINT [\"dotnet\", \"EzyTaskin.dll\"]
+
+                " > Dockerfile
+
+                git add .
+
+                git config user.name "EzyTaskin CI"
+                git config user.email "ci@ezy.trungnt2910.com"
+
+                git commit -m "deploy: $DATE"
+
+                # TODO: Race condition with human user?
+                git push
+
+                popd
