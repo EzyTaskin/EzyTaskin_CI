@@ -187,6 +187,7 @@ jobs:
                 ENV PATH=\"\${PATH}:/root/.dotnet/tools\"
 
                 # Download archive
+                ADD "${{ github.api_url }}/repos/${{ github.repository }}/releases/latest" latest_release.json
                 RUN curl -SL ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/EzyTaskin.tar.gz | tar -xzf -
 
                 # Load development secrets & copy for publish
