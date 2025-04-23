@@ -37,8 +37,13 @@ jobs:
                 git clone git@frontend.ezytaskin:${{ github.repository_owner }}/${{ env.REPO_FRONTEND }}.git ${{ github.workspace }}/frontend
 
                 pushd frontend
+
+                git fetch origin ${{ env.EZY_COMMIT }}
+                git reset --hard ${{ env.EZY_COMMIT }}
+
                 npm install
                 npm run build
+
                 popd
 
             - name: Mark Commit Success
